@@ -12,14 +12,26 @@ import threading
 from datetime import datetime, timedelta
 from threading import Timer
 import time
+import urllib
+import random
+import aiml
+import os
+os.chdir('./alice')
+alice = aiml.Kernel()
 
 MAX_GROUP_NUM = 2  # 每组人数
 QRImagePath = os.path.join(os.getcwd(), 'qrcode.jpg')
 deviceId = 'e000000000000000'
 DEBUG=False
-MemberList=[]
+MemberList=[]           #好友详细信息
+FriendUserNameList=[]       #好友username
 INTERFACE_CALLING_INTERVAL=5
 tasks=[]
+QunList=[]                #最近联系的群username
+qunMemberList=[]              #最近联系的人的群成员
+noRobotList=[]
+#init获取的联系人不全
+#第二次sync心跳包的时候可以获取所有最近联系人
 
 #登录模块源自https://github.com/0x5e/wechat-deleted-friends
 def getUUID():
@@ -194,10 +206,12 @@ def webwxinit():
     dic = data
     ContactList = dic['ContactList']
     My = dic['User']
+    noRobotList.append(My['UserName'])
     SyncKey = dic['SyncKey']
 
     state = responseState('webwxinit', dic['BaseResponse'])
     return state
+
 
 def webwxgetcontact():
 
@@ -234,6 +248,8 @@ def webwxgetcontact():
             MemberList.remove(Member)
         elif Member['UserName'] == My['UserName']:  # 自己
             MemberList.remove(Member)
+        else:
+            FriendUserNameList.append(Member['UserName'])   #所有好友的username入数组
 
     return MemberList
 
@@ -269,11 +285,61 @@ def syncCheck():
 
     return selector
 
+def notify():
+    url = base_uri + '/webwxstatusnotify?lang=zh_CN&pass_ticket=%s' % (
+         urllib.quote_plus(pass_ticket))
+    ClientMsgId = '%s%s' % (int(time.time()), '300')
+    params = {
+        'BaseRequest': BaseRequest,
+        'Code': '3',
+        'FromUserName': My['UserName'],
+        'ToUserName': My['UserName'],
+        'ClientMsgId': ClientMsgId,
+    }
+    headers = {'content-type': 'application/json; charset=UTF-8'}
+
+    r = myRequests.post(url=url, data=json.dumps(params))
+    r.encoding = 'utf-8'
+    data = r.json()
+    dic = data
+    state = responseState('notify', dic['BaseResponse'])
+    return state
+
+def getqunmember(qunList):
+    qunList2=[]
+    for qun in qunList:
+        qunList2.append({"UserName":qun,"EncryChatRoomId":""})
+    r = '%s%s' % (int(time.time()), '300')
+    url = base_uri + '/webwxbatchgetcontact?type=ex&r=%s&lang=zh_CN&pass_ticket=%s' % (
+        r, urllib.quote_plus(pass_ticket))
+    params = {
+        'BaseRequest': BaseRequest,
+        'Count': str(len(QunList)),
+        'List': qunList2,
+    }
+    headers = {'content-type': 'application/json; charset=UTF-8'}
+
+    r = myRequests.post(url=url, data=json.dumps(params))
+    r.encoding = 'utf-8'
+    data = r.json()
+    dic=data
+
+    ContactList=dic['ContactList']
+    for contact in ContactList:
+        if contact['MemberCount']>1:
+            for member in contact['MemberList']:
+                if not member['UserName'] in qunMemberList:
+                    qunMemberList.append(member['UserName'])
+
+
+    state = responseState('getqunmember', dic['BaseResponse'])
+    return state
+
 def webwxsync():
     global SyncKey
 
     url = base_uri + '/webwxsync?lang=zh_CN&skey=%s&sid=%s&pass_ticket=%s' % (
-        BaseRequest['Skey'], BaseRequest['Sid'], quote_plus(pass_ticket))
+        BaseRequest['Skey'], BaseRequest['Sid'], urllib.quote_plus(pass_ticket))
     params = {
         'BaseRequest': BaseRequest,
         'SyncKey': SyncKey,
@@ -288,17 +354,76 @@ def webwxsync():
     # print(data)
 
     dic = data
+    try:
+        if not int(dic['AddMsgCount'])==0:   #有新消息
+                for message in dic['AddMsgList']:
+                    if message['MsgType']==1: #新消息，文字消息
+                        try:
+                            print message['FromUserName'],message['Content']
+                        except:
+                            print message['FromUserName'],'can not  print'
+                        if  message['FromUserName'] in noRobotList:
+                            continue
+                        if '@@' in message['FromUserName']:   #不回复群
+                            continue
+                        url = 'https://wx2.qq.com/cgi-bin/mmwebwx-bin/webwxsendmsg'
+                        ids=random.randint(1000000,8999999)
+                        ClientMsgID = '%s%s' % (int(time.time()),ids)
+                        myWords=alice.respond(message['Content'])
+                        print 'reply:'+myWords
+                        Msg = {
+                            'Type': 1,
+                            'Content':myWords+ '------reply from a robot named alice',
+                            'FromUserName': My["UserName"],
+                            'ToUserName': message['FromUserName'],
+                            'LocalID': ClientMsgID,
+                            'ClientMsgId': ClientMsgID
+                        }
+
+                        params = {
+                            'BaseRequest': BaseRequest,
+                            'Msg': Msg,
+                            'Scene': '0'
+                        }
+                        headers = {'content-type': 'application/json; charset=UTF-8'}
+
+                        r = myRequests.post(url=url, data=json.dumps(params), headers=headers)
+                        r.encoding = 'utf-8'
+                        data = r.json()
+                        pass
+                    if message['MsgType'] == 51:  # 最近联系人消息，可以获取群号
+                        if not len(QunList) == 0:
+                            continue
+                        if message['StatusNotifyUserName'] !='':
+                            lists=message['StatusNotifyUserName'].split(',')
+                            if len(lists)>0:
+                                for UserName in lists:
+                                    if UserName.find('@@') != -1:  # 群聊
+                                        QunList.append(UserName)
+    except:
+        print 'error'
+        pass
+
     SyncKey = dic['SyncKey']
 
     state = responseState('webwxsync', dic['BaseResponse'])
     return state
 
+
 def heartBeatLoop():
     while True:
+        syncCheck()
+        webwxsync()
+        """
         selector = syncCheck()
+        print 'heart beat '+selector
         if selector != '0':
+            print 'msg'
             webwxsync()
+        """
         time.sleep(1)
+
+
 
 def sendMsg(receiver,wordsToSend):  #
     ToUserName=""
@@ -322,6 +447,63 @@ def sendMsg(receiver,wordsToSend):  #
         'Content':wordsToSend,
         'FromUserName':My["UserName"],
         'ToUserName':ToUserName,
+        'LocalID':LocalID,
+        'ClientMsgId': LocalID,
+        'Scene':0
+    }
+
+    params = {
+        'BaseRequest': BaseRequest,
+        'Msg': Msg,
+        'Scene': '0'
+    }
+    headers = {'content-type': 'application/json; charset=UTF-8'}
+
+
+
+    r = myRequests.post(url=url, data=json.dumps(params), headers=headers)
+    r.encoding = 'utf-8'
+    data = r.json()
+
+
+    dic = data
+
+    state = responseState('sendMsg', dic['BaseResponse'])
+    return state
+
+def sendFakeMsg(fromer,receiver,wordsToSend):  #
+    ToUserName=""
+    FromUserName=""
+    for member in FriendMemberList:
+        if not receiver == "":
+            if member['NickName'] == receiver:
+                ToUserName = member['UserName']
+                continue
+            if member['PYQuanPin'] == receiver:
+                ToUserName = member['UserName']
+                continue
+            if member['RemarkPYQuanPin'] == receiver:
+                ToUserName = member['UserName']
+                continue
+        if not fromer == "":
+            if member['NickName'] == fromer:
+                FromUserName = member['UserName']
+                continue
+            if member['PYQuanPin'] == fromer:
+                FromUserName = member['UserName']
+                continue
+            if member['RemarkPYQuanPin'] == fromer:
+                FromUserName = member['UserName']
+                continue
+    if ToUserName=="":
+        print("没找到该好友")
+    url = 'https://wx2.qq.com/cgi-bin/mmwebwx-bin/webwxsendmsg'
+    LocalID='%s%s'%(int(time.time()),'1234567')
+    Msg={
+        'Type':1,
+        'Content':wordsToSend,
+        'FromUserName':ToUserName,
+        'ToUserName':FromUserName,
         'LocalID':LocalID,
         'ClientMsgId': LocalID
     }
@@ -362,6 +544,54 @@ def scheduleSendMsgTask(ScheduleTime,receiver,wordsToSend):
     else:
         print '时间格式不正确，请重新制定任务'
 
+def createChatroom(UserNames):
+    MemberList = [{'UserName': UserName} for UserName in UserNames]
+
+    url = (base_uri +
+        '/webwxcreatechatroom?pass_ticket=%s&r=%s' % (
+            pass_ticket, int(time.time())) )
+    params = {
+        'BaseRequest': BaseRequest,
+        'MemberCount': len(MemberList),
+        'MemberList': MemberList,
+        'Topic': '',
+    }
+    headers = {'content-type': 'application/json; charset=UTF-8'}
+
+    r = myRequests.post(url=url, data=json.dumps(params),headers=headers)
+    r.encoding = 'utf-8'
+    data = r.json()
+
+
+    dic = data
+    ChatRoomName = dic['ChatRoomName']
+
+    state = responseState('createChatroom', dic['BaseResponse'])
+
+    return ChatRoomName
+
+def deleteMember(ChatRoomName, UserNames):
+    url = (base_uri +
+        '/webwxupdatechatroom?fun=delmember&pass_ticket=%s' % (pass_ticket) )
+    params = {
+        'BaseRequest': BaseRequest,
+        'ChatRoomName': ChatRoomName,
+        'DelMemberList': ','.join(UserNames),
+    }
+    headers = {'content-type': 'application/json; charset=UTF-8'}
+
+    r = myRequests.post(url=url, data=json.dumps(params),headers=headers)
+    r.encoding = 'utf-8'
+    data = r.json()
+
+    # print(data)
+
+    dic = data
+
+    state = responseState('deleteMember', dic['BaseResponse'])
+    return state
+
+
 def main():
     global myRequests,FriendMemberList
     if hasattr(ssl, '_create_unverified_context'):
@@ -390,18 +620,63 @@ def main():
         print '初始化失败'
         return
 
+    notify()
     FriendMemberList = webwxgetcontact()
     print '你有%d好友,每行展示他的昵称，备注名，后续可输入任一个名字：'%(len(FriendMemberList))
     i=1
     for member in FriendMemberList:
         try:
-            #print str(i)+":\t"+member['NickName']+'\t'+member['PYQuanPin']+'\t'+member['RemarkPYQuanPin']
+            #print str(i)+":\t"+member['UserName']+'\t'+member['NickName']+'\t'+member['PYQuanPin']+'\t'+member['RemarkPYQuanPin']
+            if member['NickName']=='sunshine' or member['NickName']=='nuinui':
+                noRobotList.append(member['UserName'])
             pass
         except:
             pass
         i=i+1
 
+    #获取最近联系人，然后获取群username，继而获取群成员
+
+    #sendMsg('bianzeming','test')
+
+    """
+    syncCheck()
+    webwxsync()   #开启心跳  获取最近联系人,必须先synccheck
+    getqunmember(QunList)
+    """
+    heartBeatLoop()
+    """
     threading.Thread(target=heartBeatLoop).start()
+
+
+
+    #拉陌生人入群失败。返回数据包里成功，实际上失败
+    tmp=[]
+    i=0
+    for member in qunMemberList:
+        if member in FriendMemberList:
+            continue
+        tmp.append(member)
+        i=i+1
+        if i==20:
+            break
+    createChatroom(tmp)
+
+
+
+
+    #直接伪身份发消息失败
+    sendFakeMsg('jaffer','wubo','test from lf')
+
+
+
+    #测试拉陌生人进群，失败，UserName每次都变化
+    UserNames = []
+    UserNames.append('@36fe95eaf54019da680f5ff438457bfd7ba8f1876ace9e33292d4aec209fd60b')
+    UserNames.append('@2801585d433a6296f53b4db7c703ecca1aa8d926c177229e08d6f53565c9e4e1')
+    ChatRoomName=createChatroom(UserNames)
+    deleteMember(ChatRoomName, UserNames)
+    """
+"""
 
     print '开始制定任务：'
     while True:
@@ -411,6 +686,7 @@ def main():
         threading.Thread(target=scheduleSendMsgTask,args=(when,receiver,content)).start()
         time.sleep(3)
         print ''
+    """
 
 
 # windows下编码问题修复
@@ -438,4 +714,6 @@ if sys.stdout.encoding == 'cp936':
 
 if __name__ == '__main__':
     print('my wechat')
+    alice.learn("startup.xml")
+    alice.respond('LOAD ALICE')
     main()
